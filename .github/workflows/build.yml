@@ -1,58 +1,153 @@
-name: Build APK
+name: Rebrand Lumora
+
+# Cara pakai:
+# 1. Upload APK ke root repo dengan nama: input.apk
+# 2. Simpan file ini di: .github/workflows/rebrand.yml
+# 3. Tab Actions > Rebrand Lumora > Run workflow (isi nama paket & nama aplikasi)
+# 4. Hasil APK ada di bagian Artifacts di halaman run
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, master]
-
-permissions:
-  contents: write
+    inputs:
+      new_package:
+        description: Nama paket baru (huruf kecil, pakai titik)
+        default: com.lumora.launcher
+      app_name:
+        description: Nama aplikasi baru (tanpa tanda petik)
+        default: Lumora
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      NEW_PKG: ${{ inputs.new_package }}
+      APP_NAME: ${{ inputs.app_name }}
+      KS_PASS: ${{ secrets.KS_PASS || 'lumora-pass-123' }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
-      # Jika repo berisi project.zip, bongkar dulu. Jika project sudah berupa folder, langsung dipakai.
-      - name: Siapkan project
+      - name: Cari APK
         run: |
-          if [ -f project.zip ]; then
-            rm -rf _proj && mkdir _proj
-            unzip -q project.zip -d _proj
+          APK=$(ls -1 *.apk 2>/dev/null | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "::error::Tidak ada file .apk di root repo. Upload APK ke root repo, bukan ke dalam folder."
+            ls -la
+            exit 1
           fi
-          S=$(find . -name settings.gradle.kts -not -path "./.git/*" | head -n 1)
-          if [ -z "$S" ]; then echo "settings.gradle.kts tidak ditemukan"; exit 1; fi
-          echo "PROJECT_DIR=$(dirname "$S")" >> "$GITHUB_ENV"
+          echo "Memakai: $APK"
+          [ "$APK" = "input.apk" ] || cp "$APK" input.apk
 
-      - name: Build APK
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Unduh apktool
         run: |
-          chmod +x ./gradlew
-          set -o pipefail
-          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+          curl -sSL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
 
-      # Kalau gagal, ringkasan error muncul di halaman run (mudah disalin dari HP)
-      - name: Ringkasan error
-        if: failure()
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Bongkar APK
+        run: java -jar apktool.jar d input.apk -o out -f
+
+      - name: Ganti identitas
         run: |
-          {
-            echo '## Build gagal'
-            echo '```'
-            grep -E '^e: |error:|What went wrong|Could not|FAILED' -A4 build.log | head -150
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import os, re, glob, pathlib
+          from xml.sax.saxutils import escape
 
-      - name: Rilis APK
-        if: success()
-        uses: softprops/action-gh-release@v2
+          NEW = os.environ['NEW_PKG'].strip()
+          NAME = escape(os.environ['APP_NAME'].strip(), {'"': '&quot;'})
+
+          man = pathlib.Path('out/AndroidManifest.xml')
+          m = man.read_text('utf8')
+          OLD = re.search(r'package="([^"]+)"', m).group(1)
+          print('Paket lama:', OLD, '-> baru:', NEW)
+
+          # Hanya izin & authority yang memuat nama paket yang diganti.
+          # Nama kelas (kode) tidak diubah supaya aplikasi tetap jalan.
+          def fix(t):
+              for tok in ('.permission.READ_SETTINGS', '.permission.WRITE_SETTINGS',
+                          '.settings', '.grid_control', '.TestInfo'):
+                  t = re.sub(re.escape(OLD + tok) + r'(?![\w.$])', NEW + tok, t)
+              return t
+
+          # Label aplikasi + label activity launcher
+          app_tag = re.search(r'<application\b[^>]*>', m, re.S).group(0)
+          tags = [app_tag] + [t for t in re.findall(r'<activity\b[^>]*>', m, re.S)
+                              if OLD + '.NothingLauncher"' in t]
+          names = set()
+          for t in tags:
+              lm = re.search(r'android:label="([^"]*)"', t)
+              if not lm:
+                  continue
+              v = lm.group(1)
+              if v.startswith('@string/'):
+                  names.add(v[len('@string/'):])
+              else:
+                  m = m.replace(t, t.replace(lm.group(0), 'android:label="%s"' % NAME))
+
+          m = m.replace('package="%s"' % OLD, 'package="%s"' % NEW, 1)
+          m = fix(m)
+          man.write_text(m, 'utf8')
+
+          n = 0
+          for f in glob.glob('out/smali*/**/*.smali', recursive=True):
+              p = pathlib.Path(f)
+              t = p.read_text('utf8')
+              u = fix(t.replace('"%s"' % OLD, '"%s"' % NEW))
+              if u != t:
+                  p.write_text(u, 'utf8')
+                  n += 1
+          print('File smali diubah:', n)
+
+          for f in glob.glob('out/res/values*/*.xml'):
+              p = pathlib.Path(f)
+              t = p.read_text('utf8')
+              u = t
+              for nm in names:
+                  u = re.sub(r'(<string name="%s"[^>]*>)[^<]*(</string>)' % re.escape(nm),
+                             lambda mo: mo.group(1) + NAME + mo.group(2), u)
+              u = u.replace('Nothing Launcher', NAME)
+              if u != t:
+                  p.write_text(u, 'utf8')
+
+          refs = sorted(set(re.findall(r'com\.nothing\.[\w.]+', man.read_text('utf8'))))
+          rep = ['## Laporan rebrand', '',
+                 'Paket: %s -> %s' % (OLD, NEW),
+                 'Nama aplikasi: %s' % os.environ['APP_NAME'], '',
+                 'Referensi com.nothing yang masih ada di manifest',
+                 '(nama kelas = namespace kode internal, bukan dependensi aplikasi lain):', '']
+          rep += ['- ' + r for r in refs]
+          if os.path.exists('out/lib/arm64-v8a/libWeatherWidgetKeys.so'):
+              rep += ['', 'PERHATIAN: widget cuaca masih memakai kunci/server milik Nothing',
+                      '(libWeatherWidgetKeys.so). Perlu diganti penyedia cuaca sendiri',
+                      'supaya benar-benar mandiri.']
+          open('report.txt', 'w').write('\n'.join(rep) + '\n')
+          PY
+          cat report.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build ulang
+        run: java -jar apktool.jar b out -o unsigned.apk --use-aapt2
+
+      - name: Zipalign dan tanda tangan
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          if [ -f my.keystore ]; then
+            echo "Pakai my.keystore dari repo"
+          else
+            keytool -genkeypair -keystore my.keystore -alias lumora -keyalg RSA -keysize 2048 \
+              -validity 36500 -storepass "$KS_PASS" -keypass "$KS_PASS" -dname "CN=Lumora"
+            echo "Keystore baru dibuat. Simpan my.keystore dari Artifacts ke repo PRIVATE supaya update berikutnya bisa menimpa aplikasi lama."
+          fi
+          "$BT/zipalign" -p -f 4 unsigned.apk aligned.apk
+          "$BT/apksigner" sign --ks my.keystore --ks-pass "pass:$KS_PASS" --ks-key-alias lumora \
+            --out Lumora-rebrand.apk aligned.apk
+          "$BT/apksigner" verify Lumora-rebrand.apk
+
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: build-${{ github.run_number }}
-          name: MixBase build ${{ github.run_number }}
-          files: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
+          name: Lumora-rebrand
+          path: |
+            Lumora-rebrand.apk
+            my.keystore
+            report.txt
