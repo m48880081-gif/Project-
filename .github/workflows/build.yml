@@ -12,42 +12,76 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
 
-      # Jika repo berisi project.zip, bongkar dulu. Jika project sudah berupa folder, langsung dipakai.
+      # Jika repo berisi project.zip, bongkar dulu dan PAKAI isinya (bukan folder lama yang mungkin tertinggal).
+      # Jika tidak ada project.zip, cari project di repo.
       - name: Siapkan project
         run: |
           if [ -f project.zip ]; then
             rm -rf _proj && mkdir _proj
             unzip -q project.zip -d _proj
+            SEARCH=_proj
+          else
+            SEARCH=.
           fi
-          S=$(find . -name settings.gradle.kts -not -path "./.git/*" | head -n 1)
+          # Ambil settings.gradle.kts yang paling dangkal (paling dekat ke root)
+          S=$(find "$SEARCH" -name settings.gradle.kts -not -path "./.git/*" -printf '%d %p\n' | sort -n | head -n 1 | cut -d' ' -f2-)
           if [ -z "$S" ]; then echo "settings.gradle.kts tidak ditemukan"; exit 1; fi
+          echo "Project dipakai: $S"
           echo "PROJECT_DIR=$(dirname "$S")" >> "$GITHUB_ENV"
 
+      # Penyebab umum "paket tampaknya tidak valid": versionCode APK baru LEBIH KECIL atau sama
+      # dengan yang sudah terpasang. Di sini versionCode dibuat naik terus tiap build (menit sejak 1970).
+      - name: Naikkan versionCode otomatis
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          VC=$(( $(date -u +%s) / 60 ))
+          sed -i -E "s/(versionCode[[:space:]]*=[[:space:]]*)[0-9]+/\1${VC}/" app/build.gradle.kts
+          grep -n "versionCode" app/build.gradle.kts
+          if ! grep -Eq "versionCode[[:space:]]*=[[:space:]]*${VC}\b" app/build.gradle.kts; then
+            echo "versionCode gagal diubah di app/build.gradle.kts"; exit 1
+          fi
+          echo "VERSION_CODE=$VC" >> "$GITHUB_ENV"
+
       - name: Build APK
+        id: build
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           chmod +x ./gradlew
           set -o pipefail
-          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+          ./gradlew assembleRelease --no-daemon --stacktrace --console=plain 2>&1 | tee build.log
 
-      # Kalau gagal, ringkasan error muncul di halaman run (mudah disalin dari HP)
+      # Kalau gagal, penyebab error muncul di tab Summary pada halaman run (mudah disalin dari HP).
       - name: Ringkasan error
-        if: failure()
+        if: failure() && steps.build.outcome == 'failure'
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           {
             echo '## Build gagal'
+            echo
+            echo '### Penyebab utama'
             echo '```'
-            grep -E '^e: |error:|What went wrong|Could not|FAILED' -A4 build.log | head -150
+            grep -E -A6 'What went wrong|Execution failed|^e: |Duplicate class|Could not (resolve|find|get)|Unresolved reference|OutOfMemory|disappeared unexpectedly' build.log | head -120
+            echo '```'
+            echo
+            echo '### 60 baris terakhir log'
+            echo '```'
+            tail -n 60 build.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Simpan log build
+        if: failure() && steps.build.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ env.PROJECT_DIR }}/build.log
 
       - name: Beri nama APK
         if: success()
@@ -57,10 +91,101 @@ jobs:
           for f in *.apk; do mv "$f" "PlayTube-${{ github.run_number }}.apk"; break; done
           ls -la
 
+      # Pastikan APK utuh, bertanda tangan sah, dan versinya benar SEBELUM dirilis.
+      # Hasilnya tampil di Summary run dan di catatan rilis. Kalau ada yang gagal, APK tidak dirilis.
+      - name: Periksa APK
+        if: success()
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          cd app/build/outputs/apk/release
+          APK=$(ls *.apk | head -n 1)
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -n 1)
+          AS="$BT/apksigner"; AAPT2="$BT/aapt2"; ZA="$BT/zipalign"
+          set +e
+          FAIL=0
+          : > check.txt
+          say() { echo "$*" >> check.txt; }
+
+          say "== 1. Berkas APK utuh =="
+          if unzip -tq "$APK" >> check.txt 2>&1; then say "OK"; else say "GAGAL: berkas rusak"; FAIL=1; fi
+
+          say ""
+          say "== 2. Tanda tangan =="
+          if [ -x "$AS" ]; then
+            "$AS" verify --verbose --print-certs "$APK" > sig.txt 2>&1; RS=$?
+            cat sig.txt >> check.txt
+            if [ $RS -ne 0 ]; then
+              say "GAGAL: tanda tangan tidak sah atau APK belum ditandatangani"; FAIL=1
+            elif ! grep -Eq 'Verified using v[23] scheme.*: true' sig.txt; then
+              say "GAGAL: tidak ada tanda tangan v2/v3"; FAIL=1
+            else
+              say "OK"
+            fi
+          else
+            say "apksigner tidak ditemukan, dilewati"
+          fi
+
+          say ""
+          say "== 3. Isi manifest =="
+          if [ -x "$AAPT2" ]; then
+            "$AAPT2" dump badging "$APK" > badging.txt 2>&1
+            grep -E "^(package|sdkVersion|targetSdkVersion|application-label):" badging.txt >> check.txt
+            if grep -q "versionCode='$VERSION_CODE'" badging.txt; then
+              say "OK: versionCode = $VERSION_CODE"
+            else
+              say "GAGAL: versionCode di APK bukan $VERSION_CODE"; FAIL=1
+            fi
+            if "$AAPT2" dump xmltree "$APK" --file AndroidManifest.xml 2>/dev/null | grep -qi "testOnly"; then
+              say "GAGAL: APK bertanda testOnly (HP menolaknya)"; FAIL=1
+            fi
+          else
+            say "aapt2 tidak ditemukan, dilewati"
+          fi
+
+          say ""
+          say "== 4. Perataan zip (zipalign) =="
+          if [ -x "$ZA" ]; then
+            if "$ZA" -c 4 "$APK" >> check.txt 2>&1; then say "OK"; else say "PERINGATAN: zipalign tidak lolos"; fi
+          else
+            say "zipalign tidak ditemukan, dilewati"
+          fi
+
+          SIZE=$(stat -c %s "$APK")
+          MB=$(awk -v s="$SIZE" 'BEGIN{printf "%.2f", s/1000000}' | tr . ,)
+          MIB=$(awk -v s="$SIZE" 'BEGIN{printf "%.2f", s/1048576}' | tr . ,)
+          SHA=$(sha256sum "$APK" | cut -d' ' -f1)
+          echo "$SHA  $APK" > "$APK.sha256"
+          say ""
+          say "Ukuran  : $SIZE byte (sekitar $MB MB atau $MIB MiB)"
+          say "SHA-256 : $SHA"
+
+          {
+            echo '## Hasil periksa APK'
+            echo '```'
+            cat check.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "**PlayTube build ${{ github.run_number }}**"
+            echo
+            echo "- Berkas: \`$APK\`"
+            echo "- Ukuran asli: **$SIZE byte** (sekitar $MB MB atau $MIB MiB). Kalau ukuran file hasil unduhan di HP lebih kecil dari ini, unduhannya terputus: hapus lalu unduh ulang."
+            echo "- versionCode: $VERSION_CODE"
+            echo "- SHA-256: \`$SHA\`"
+            echo
+            echo "Kalau di HP sudah ada PlayTube lama, **copot dulu** (Setelan > Aplikasi > PlayTube > Copot), lalu pasang APK ini."
+          } > "$GITHUB_WORKSPACE/release-notes.md"
+
+          [ $FAIL -eq 0 ]
+
       - name: Rilis APK
         if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
           name: PlayTube build ${{ github.run_number }}
-          files: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
+          body_path: release-notes.md
+          files: |
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk.sha256
